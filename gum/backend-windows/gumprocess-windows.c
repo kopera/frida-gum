@@ -11,6 +11,7 @@
 #include "gum/gumdbghelp.h"
 #include "gum/gumwindows.h"
 
+#include <winternl.h>
 #include <intrin.h>
 #include <psapi.h>
 #include <tchar.h>
@@ -21,6 +22,9 @@
 # pragma GCC diagnostic ignored "-Warray-bounds"
 #endif
 
+typedef NTSTATUS (WINAPI * GumQueryInformationProcessFunc) (HANDLE process,
+    PROCESSINFOCLASS information_class, PVOID information,
+    ULONG information_length, PULONG return_length);
 typedef HRESULT (WINAPI * GumGetThreadDescriptionFunc) (
     HANDLE thread, WCHAR ** description);
 typedef void (WINAPI * GumGetCurrentThreadStackLimitsFunc) (
@@ -166,41 +170,7 @@ void
 _gum_process_enumerate_threads (GumFoundThreadFunc func,
                                 gpointer user_data)
 {
-  DWORD this_process_id;
-  HANDLE snapshot;
-  THREADENTRY32 entry;
-
-  this_process_id = GetCurrentProcessId ();
-
-  snapshot = CreateToolhelp32Snapshot (TH32CS_SNAPTHREAD, 0);
-  if (snapshot == INVALID_HANDLE_VALUE)
-    goto beach;
-
-  entry.dwSize = sizeof (entry);
-  if (!Thread32First (snapshot, &entry))
-    goto beach;
-
-  do
-  {
-    if (RTL_CONTAINS_FIELD (&entry, entry.dwSize, th32OwnerProcessID) &&
-        entry.th32OwnerProcessID == this_process_id)
-    {
-      GumThreadDetails details;
-
-      if (gum_windows_get_thread_details (entry.th32ThreadID, &details))
-      {
-        if (!func (&details, user_data))
-          break;
-      }
-    }
-
-    entry.dwSize = sizeof (entry);
-  }
-  while (Thread32Next (snapshot, &entry));
-
-beach:
-  if (snapshot != INVALID_HANDLE_VALUE)
-    CloseHandle (snapshot);
+  gum_windows_enumerate_threads (GetCurrentProcessId (), func, user_data);
 }
 
 static gboolean
@@ -315,65 +285,7 @@ void
 _gum_process_enumerate_modules (GumFoundModuleFunc func,
                                 gpointer user_data)
 {
-  HANDLE this_process;
-  HMODULE first_module;
-  DWORD modules_size = 0;
-  HMODULE * modules = NULL;
-  guint mod_idx;
-
-  this_process = GetCurrentProcess ();
-
-  if (!EnumProcessModules (this_process, &first_module, sizeof (first_module),
-      &modules_size))
-  {
-    goto beach;
-  }
-
-  modules = (HMODULE *) g_malloc (modules_size);
-
-  if (!EnumProcessModules (this_process, modules, modules_size, &modules_size))
-  {
-    goto beach;
-  }
-
-  for (mod_idx = 0; mod_idx != modules_size / sizeof (HMODULE); mod_idx++)
-  {
-    MODULEINFO mi;
-    WCHAR module_path_utf16[MAX_PATH];
-    gchar * module_path, * module_name;
-    GumMemoryRange range;
-    GumModuleDetails details;
-    gboolean carry_on;
-
-    if (!GetModuleInformation (this_process, modules[mod_idx], &mi,
-        sizeof (mi)))
-    {
-      continue;
-    }
-
-    GetModuleFileNameW (modules[mod_idx], module_path_utf16, MAX_PATH);
-    module_path_utf16[MAX_PATH - 1] = '\0';
-    module_path = g_utf16_to_utf8 ((const gunichar2 *) module_path_utf16, -1,
-        NULL, NULL, NULL);
-    module_name = strrchr (module_path, '\\') + 1;
-
-    range.base_address = GUM_ADDRESS (mi.lpBaseOfDll);
-    range.size = mi.SizeOfImage;
-
-    details.name = module_name;
-    details.range = &range;
-    details.path = module_path;
-
-    carry_on = func (&details, user_data);
-
-    g_free (module_path);
-
-    if (!carry_on)
-      break;
-  }
-
-beach:
-  g_free (modules);
+  gum_windows_enumerate_modules (GetCurrentProcess (), func, user_data);
 }
 
 void
@@ -984,6 +896,155 @@ get_module_handle_utf8 (const gchar * module_name)
   g_free (wide_name);
 
   return module;
+}
+
+GumAddress
+gum_windows_find_entrypoint (HANDLE process)
+{
+  static gsize initialized = FALSE;
+  static GumQueryInformationProcessFunc query_process_information;
+  NTSTATUS nt_status;
+  PROCESS_BASIC_INFORMATION process_information;
+  size_t image_base_address;
+  BYTE headers[sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64)];
+  PIMAGE_DOS_HEADER dos_header;
+  PIMAGE_NT_HEADERS64 nt_headers;
+
+  memset (&process_information, 0, sizeof (PROCESS_INFORMATION));
+  memset (headers, 0, sizeof (headers));
+
+  if (g_once_init_enter (&initialized))
+  {
+    query_process_information = (GumQueryInformationProcessFunc)
+        GetProcAddress (GetModuleHandle (_T ("ntdll.dll")),
+          "NtQueryInformationProcess");
+
+    g_once_init_leave (&initialized, TRUE);
+  }
+
+  if (query_process_information == NULL)
+    return 0;
+
+  nt_status = query_process_information (process, 0,
+      &process_information, sizeof (PROCESS_BASIC_INFORMATION), NULL);
+  if (nt_status != 0)
+    return 0;
+
+  // FIXME: change offsets for 32 bits
+  if (!ReadProcessMemory(process,
+      (BYTE*) process_information.PebBaseAddress + 0x10,
+      &image_base_address, sizeof (image_base_address), NULL))
+  {
+    return 0;
+  }
+
+  if (!ReadProcessMemory(process, (void*) image_base_address,
+      headers, sizeof(headers), NULL))
+  {
+    return 0;
+  }
+
+  dos_header = (PIMAGE_DOS_HEADER) headers;
+  nt_headers = (PIMAGE_NT_HEADERS64) (headers + dos_header->e_lfanew);
+
+  return nt_headers->OptionalHeader.AddressOfEntryPoint + image_base_address;
+}
+
+void
+gum_windows_enumerate_threads (DWORD process_id,
+                               GumFoundThreadFunc func,
+                               gpointer user_data)
+{
+  HANDLE snapshot;
+  THREADENTRY32 entry;
+
+  snapshot = CreateToolhelp32Snapshot (TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE)
+    goto beach;
+
+  entry.dwSize = sizeof (entry);
+  if (!Thread32First (snapshot, &entry))
+    goto beach;
+
+  do
+  {
+    if (RTL_CONTAINS_FIELD (&entry, entry.dwSize, th32OwnerProcessID) &&
+        entry.th32OwnerProcessID == process_id)
+    {
+      GumThreadDetails details;
+
+      if (gum_windows_get_thread_details (entry.th32ThreadID, &details))
+      {
+        if (!func (&details, user_data))
+          break;
+      }
+    }
+
+    entry.dwSize = sizeof (entry);
+  }
+  while (Thread32Next (snapshot, &entry));
+
+beach:
+  if (snapshot != INVALID_HANDLE_VALUE)
+    CloseHandle (snapshot);
+}
+
+void
+gum_windows_enumerate_modules (HANDLE process,
+                               GumFoundModuleFunc func,
+                               gpointer user_data)
+{
+  HMODULE first_module;
+  DWORD modules_size = 0;
+  HMODULE * modules = NULL;
+  guint mod_idx;
+
+  if (!EnumProcessModules (process, &first_module, sizeof (first_module),
+      &modules_size))
+  {
+    goto beach;
+  }
+
+  modules = (HMODULE *) g_malloc (modules_size);
+
+  if (!EnumProcessModules (process, modules, modules_size, &modules_size))
+    goto beach;
+
+  for (mod_idx = 0; mod_idx != modules_size / sizeof (HMODULE); mod_idx++)
+  {
+    MODULEINFO mi;
+    WCHAR module_path_utf16[MAX_PATH];
+    gchar * module_path, * module_name;
+    GumMemoryRange range;
+    GumModuleDetails details;
+    gboolean carry_on;
+
+    if (!GetModuleInformation (process, modules[mod_idx], &mi, sizeof (mi)))
+      continue;
+
+    GetModuleFileNameW (modules[mod_idx], module_path_utf16, MAX_PATH);
+    module_path_utf16[MAX_PATH - 1] = '\0';
+    module_path = g_utf16_to_utf8 ((const gunichar2 *) module_path_utf16, -1,
+        NULL, NULL, NULL);
+    module_name = strrchr (module_path, '\\') + 1;
+
+    range.base_address = GUM_ADDRESS (mi.lpBaseOfDll);
+    range.size = mi.SizeOfImage;
+
+    details.name = module_name;
+    details.range = &range;
+    details.path = module_path;
+
+    carry_on = func (&details, user_data);
+
+    g_free (module_path);
+
+    if (!carry_on)
+      break;
+  }
+
+beach:
+  g_free (modules);
 }
 
 void

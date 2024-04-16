@@ -7,6 +7,8 @@
 #ifndef __GUM_WINDOWS_H__
 #define __GUM_WINDOWS_H__
 
+#include "gumprocess.h"
+
 #include <gum/gummemory.h>
 
 #include <glib.h>
@@ -16,6 +18,12 @@
 #include <windows.h>
 
 G_BEGIN_DECLS
+
+GUM_API GumAddress gum_windows_find_entrypoint (HANDLE process);
+GUM_API void gum_windows_enumerate_threads (DWORD process_id,
+    GumFoundThreadFunc func, gpointer user_data);
+GUM_API void gum_windows_enumerate_modules (HANDLE process,
+    GumFoundModuleFunc func, gpointer user_data);
 
 GUM_API void gum_windows_parse_context (const CONTEXT * context,
     GumCpuContext * cpu_context);
