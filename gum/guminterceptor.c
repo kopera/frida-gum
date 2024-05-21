@@ -20,6 +20,13 @@
 #ifdef HAVE_DARWIN
 # include <mach/mach.h>
 #endif
+#ifdef HAVE_LINUX
+# define GUM_INTERCEPTOR_USE_ALT_STACK
+# define GUM_INTERCEPTOR_ALT_STACK_SIZE (1 * 1024 * 1024)
+#endif
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+# include <ucontext.h>
+#endif
 
 #ifdef HAVE_MIPS
 # define GUM_INTERCEPTOR_CODE_SLICE_SIZE 1024
@@ -126,6 +133,12 @@ struct _InterceptorThreadContext
   GumInvocationStack * stack;
 
   GArray * listener_data_slots;
+
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+  ucontext_t orig;
+  ucontext_t alt;
+  gpointer alt_stack;
+#endif
 };
 
 struct _GumInvocationStackEntry
@@ -204,6 +217,10 @@ static void gum_function_context_add_listener (
 static void gum_function_context_remove_listener (
     GumFunctionContext * function_ctx, GumInvocationListener * listener);
 static void listener_entry_free (ListenerEntry * entry);
+static void listener_entry_on_enter ( ListenerEntry * listener_entry,
+    GumInvocationContext * invocation_ctx);
+static void listener_entry_on_leave ( ListenerEntry * listener_entry,
+    GumInvocationContext * invocation_ctx);
 static gboolean gum_function_context_has_listener (
     GumFunctionContext * function_ctx, GumInvocationListener * listener);
 static ListenerEntry ** gum_function_context_find_listener (
@@ -1619,16 +1636,17 @@ _gum_function_context_begin_invocation (GumFunctionContext * function_ctx,
       state.invocation_data = stack_entry->listener_invocation_data[i];
       invocation_ctx->backend->data = &state;
 
-#ifndef GUM_DIET
-      if (listener_entry->listener_interface->on_enter != NULL)
-      {
-        listener_entry->listener_interface->on_enter (
-            listener_entry->listener_instance, invocation_ctx);
-      }
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+      g_assert_no_errno (getcontext (&interceptor_ctx->alt));
+      interceptor_ctx->alt.uc_stack.ss_sp = interceptor_ctx->alt_stack;
+      interceptor_ctx->alt.uc_stack.ss_size = GUM_INTERCEPTOR_ALT_STACK_SIZE;
+      interceptor_ctx->alt.uc_link = &interceptor_ctx->orig;
+      makecontext (&interceptor_ctx->alt,
+        (void (*)())listener_entry_on_enter, 2, listener_entry, invocation_ctx);
+      g_assert_no_errno (swapcontext (&interceptor_ctx->orig, &interceptor_ctx->alt));
 #else
-      gum_invocation_listener_on_enter (listener_entry->listener_instance,
-          invocation_ctx);
-#endif
+      listener_entry_on_enter (listener_entry, invocation_ctx);
+#endif // GUM_INTERCEPTOR_USE_ALT_STACK
     }
 
     system_error = invocation_ctx->system_error;
@@ -1671,6 +1689,22 @@ bypass:
   }
 
   return will_trap_on_leave;
+}
+
+static void
+listener_entry_on_enter (ListenerEntry * listener_entry,
+                         GumInvocationContext * invocation_ctx)
+{
+#ifndef GUM_DIET
+  if (listener_entry->listener_interface->on_enter != NULL)
+  {
+    listener_entry->listener_interface->on_enter (
+        listener_entry->listener_instance, invocation_ctx);
+  }
+#else
+  gum_invocation_listener_on_enter (listener_entry->listener_instance,
+      invocation_ctx);
+#endif // GUM_DIET
 }
 
 void
@@ -1732,16 +1766,17 @@ _gum_function_context_end_invocation (GumFunctionContext * function_ctx,
     state.invocation_data = stack_entry->listener_invocation_data[i];
     invocation_ctx->backend->data = &state;
 
-#ifndef GUM_DIET
-    if (listener_entry->listener_interface->on_leave != NULL)
-    {
-      listener_entry->listener_interface->on_leave (
-          listener_entry->listener_instance, invocation_ctx);
-    }
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+    g_assert_no_errno (getcontext (&interceptor_ctx->alt));
+    interceptor_ctx->alt.uc_stack.ss_sp = interceptor_ctx->alt_stack;
+    interceptor_ctx->alt.uc_stack.ss_size = GUM_INTERCEPTOR_ALT_STACK_SIZE;
+    interceptor_ctx->alt.uc_link = &interceptor_ctx->orig;
+    makecontext (&interceptor_ctx->alt,
+      (void (*)())listener_entry_on_leave, 2, listener_entry, invocation_ctx);
+    g_assert_no_errno (swapcontext (&interceptor_ctx->orig, &interceptor_ctx->alt));
 #else
-    gum_invocation_listener_on_leave (listener_entry->listener_instance,
-        invocation_ctx);
-#endif
+    listener_entry_on_leave (listener_entry, invocation_ctx);
+#endif // GUM_INTERCEPTOR_USE_ALT_STACK
   }
 
   gum_thread_set_system_error (invocation_ctx->system_error);
@@ -1751,6 +1786,22 @@ _gum_function_context_end_invocation (GumFunctionContext * function_ctx,
   gum_tls_key_set_value (gum_interceptor_guard_key, NULL);
 
   g_atomic_int_dec_and_test (&function_ctx->trampoline_usage_counter);
+}
+
+static void
+listener_entry_on_leave (ListenerEntry * listener_entry,
+                               GumInvocationContext * invocation_ctx)
+{
+#ifndef GUM_DIET
+  if (listener_entry->listener_interface->on_leave != NULL)
+  {
+    listener_entry->listener_interface->on_leave (
+        listener_entry->listener_instance, invocation_ctx);
+  }
+#else
+  gum_invocation_listener_on_leave (listener_entry->listener_instance,
+      invocation_ctx);
+#endif // GUM_DIET
 }
 
 static void
@@ -1939,8 +1990,13 @@ interceptor_thread_context_new (void)
   context->stack = g_array_sized_new (FALSE, TRUE,
       sizeof (GumInvocationStackEntry), GUM_MAX_CALL_DEPTH);
 
+
   context->listener_data_slots = g_array_sized_new (FALSE, TRUE,
       sizeof (ListenerDataSlot), GUM_MAX_LISTENERS_PER_FUNCTION);
+
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+  context->alt_stack = g_malloc0 (GUM_INTERCEPTOR_ALT_STACK_SIZE);
+#endif
 
   return context;
 }
@@ -1951,6 +2007,10 @@ interceptor_thread_context_destroy (InterceptorThreadContext * context)
   g_array_free (context->listener_data_slots, TRUE);
 
   g_array_free (context->stack, TRUE);
+
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+  g_free (context->alt_stack);
+#endif
 
   g_slice_free (InterceptorThreadContext, context);
 }
