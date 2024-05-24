@@ -229,6 +229,11 @@ static ListenerEntry ** gum_function_context_find_taken_listener_slot (
     GumFunctionContext * function_ctx);
 static void gum_function_context_fixup_cpu_context (
     GumFunctionContext * function_ctx, GumCpuContext * cpu_context);
+static void gum_function_context_fixup_cpu_context (
+    GumFunctionContext * function_ctx, GumCpuContext * cpu_context);
+static void gum_function_context_begin_invocation_inner (
+    GumFunctionContext * function_ctx, GumCpuContext * cpu_context,
+    gpointer * caller_ret_addr, gpointer * next_hop, gboolean * result);
 
 static InterceptorThreadContext * get_interceptor_thread_context (void);
 static void release_interceptor_thread_context (
@@ -1537,6 +1542,35 @@ _gum_function_context_begin_invocation (GumFunctionContext * function_ctx,
                                         gpointer * caller_ret_addr,
                                         gpointer * next_hop)
 {
+  gboolean result;
+  InterceptorThreadContext * interceptor_ctx;
+
+  interceptor_ctx = get_interceptor_thread_context ();
+
+#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
+  g_assert_no_errno (getcontext (&interceptor_ctx->alt));
+  interceptor_ctx->alt.uc_stack.ss_sp = interceptor_ctx->alt_stack;
+  interceptor_ctx->alt.uc_stack.ss_size = GUM_INTERCEPTOR_ALT_STACK_SIZE;
+  interceptor_ctx->alt.uc_link = &interceptor_ctx->orig;
+  makecontext (&interceptor_ctx->alt,
+      (void (*)())gum_function_context_begin_invocation_inner, 5,
+      function_ctx, cpu_context, caller_ret_addr, next_hop, &result);
+  g_assert_no_errno (swapcontext (&interceptor_ctx->orig, &interceptor_ctx->alt));
+#else
+  gum_function_context_begin_invocation_inner (function_ctx, cpu_context,
+      caller_ret_addr, next_hop, &result);
+#endif // GUM_INTERCEPTOR_USE_ALT_STACK
+
+  return result;
+}
+
+static void
+gum_function_context_begin_invocation_inner (GumFunctionContext * function_ctx,
+                                              GumCpuContext * cpu_context,
+                                              gpointer * caller_ret_addr,
+                                              gpointer * next_hop,
+                                              gboolean * result)
+{
   GumInterceptor * interceptor;
   InterceptorThreadContext * interceptor_ctx;
   GumInvocationStack * stack;
@@ -1636,17 +1670,7 @@ _gum_function_context_begin_invocation (GumFunctionContext * function_ctx,
       state.invocation_data = stack_entry->listener_invocation_data[i];
       invocation_ctx->backend->data = &state;
 
-#ifdef GUM_INTERCEPTOR_USE_ALT_STACK
-      g_assert_no_errno (getcontext (&interceptor_ctx->alt));
-      interceptor_ctx->alt.uc_stack.ss_sp = interceptor_ctx->alt_stack;
-      interceptor_ctx->alt.uc_stack.ss_size = GUM_INTERCEPTOR_ALT_STACK_SIZE;
-      interceptor_ctx->alt.uc_link = &interceptor_ctx->orig;
-      makecontext (&interceptor_ctx->alt,
-        (void (*)())listener_entry_on_enter, 2, listener_entry, invocation_ctx);
-      g_assert_no_errno (swapcontext (&interceptor_ctx->orig, &interceptor_ctx->alt));
-#else
       listener_entry_on_enter (listener_entry, invocation_ctx);
-#endif // GUM_INTERCEPTOR_USE_ALT_STACK
     }
 
     system_error = invocation_ctx->system_error;
@@ -1688,7 +1712,7 @@ bypass:
     g_atomic_int_dec_and_test (&function_ctx->trampoline_usage_counter);
   }
 
-  return will_trap_on_leave;
+  *result = will_trap_on_leave;
 }
 
 static void
