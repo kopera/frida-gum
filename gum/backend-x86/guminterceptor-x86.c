@@ -36,6 +36,8 @@ typedef struct _GumX86FunctionContextData GumX86FunctionContextData;
 struct _GumInterceptorBackend
 {
   GumCodeAllocator * allocator;
+  gpointer * stack_orig;
+  gpointer * stack_alt;
 
   GumX86Writer writer;
   GumX86Relocator relocator;
@@ -58,12 +60,15 @@ static void gum_interceptor_backend_create_thunks (
 static void gum_interceptor_backend_destroy_thunks (
     GumInterceptorBackend * self);
 
-static void gum_emit_enter_thunk (GumX86Writer * cw);
-static void gum_emit_leave_thunk (GumX86Writer * cw);
+static void gum_interceptor_backend_emit_enter_thunk (
+    GumInterceptorBackend * self, GumX86Writer * cw);
+static void gum_interceptor_backend_emit_leave_thunk (
+    GumInterceptorBackend * self, GumX86Writer * cw);
 
-static void gum_emit_prolog (GumX86Writer * cw,
-    gssize stack_displacement);
-static void gum_emit_epilog (GumX86Writer * cw, GumPointCut point_cut);
+static void gum_interceptor_backend_emit_prolog (
+    GumInterceptorBackend * self, GumX86Writer * cw, gssize stack_displacement);
+static void gum_interceptor_backend_emit_epilog (
+    GumInterceptorBackend * self, GumX86Writer * cw, GumPointCut point_cut);
 
 GumInterceptorBackend *
 _gum_interceptor_backend_create (GRecMutex * mutex,
@@ -73,6 +78,7 @@ _gum_interceptor_backend_create (GRecMutex * mutex,
 
   backend = g_slice_new (GumInterceptorBackend);
   backend->allocator = allocator;
+  backend->stack_alt = gum_alloc_n_pages ((2 * 1024 * 1024) / gum_query_page_size (), GUM_PAGE_RW);
 
   gum_x86_writer_init (&backend->writer, NULL);
   gum_x86_relocator_init (&backend->relocator, NULL, &backend->writer);
@@ -322,13 +328,13 @@ gum_interceptor_backend_create_thunks (GumInterceptorBackend * self)
 
   self->enter_thunk = gum_code_allocator_alloc_slice (self->allocator);
   gum_x86_writer_reset (cw, self->enter_thunk->data);
-  gum_emit_enter_thunk (cw);
+  gum_interceptor_backend_emit_enter_thunk (self, cw);
   gum_x86_writer_flush (cw);
   g_assert (gum_x86_writer_offset (cw) <= self->enter_thunk->size);
 
   self->leave_thunk = gum_code_allocator_alloc_slice (self->allocator);
   gum_x86_writer_reset (cw, self->leave_thunk->data);
-  gum_emit_leave_thunk (cw);
+  gum_interceptor_backend_emit_leave_thunk (self, cw);
   gum_x86_writer_flush (cw);
   g_assert (gum_x86_writer_offset (cw) <= self->leave_thunk->size);
 }
@@ -342,13 +348,15 @@ gum_interceptor_backend_destroy_thunks (GumInterceptorBackend * self)
 }
 
 static void
-gum_emit_enter_thunk (GumX86Writer * cw)
+gum_interceptor_backend_emit_enter_thunk (GumInterceptorBackend * self,
+                                          GumX86Writer * cw)
 {
   const gssize return_address_stack_displacement = 0;
   const gchar * prepare_trap_on_leave = "prepare_trap_on_leave";
   gpointer epilog;
 
-  gum_emit_prolog (cw, return_address_stack_displacement);
+  gum_interceptor_backend_emit_prolog (self, cw,
+      return_address_stack_displacement);
 
   gum_x86_writer_put_lea_reg_reg_offset (cw, GUM_X86_XSI,
       GUM_X86_XBP, GUM_FRAME_OFFSET_CPU_CONTEXT);
@@ -373,7 +381,7 @@ gum_emit_enter_thunk (GumX86Writer * cw)
     epilog = gum_x86_writer_cur (cw);
   }
 
-  gum_emit_epilog (cw, GUM_POINT_ENTER);
+  gum_interceptor_backend_emit_epilog (self, cw, GUM_POINT_ENTER);
 
   if ((cw->cpu_features & GUM_CPU_CET_SS) != 0)
   {
@@ -387,11 +395,12 @@ gum_emit_enter_thunk (GumX86Writer * cw)
 }
 
 static void
-gum_emit_leave_thunk (GumX86Writer * cw)
+gum_interceptor_backend_emit_leave_thunk (GumInterceptorBackend * self,
+                                          GumX86Writer * cw)
 {
   const gssize next_hop_stack_displacement = -((gssize) sizeof (gpointer));
 
-  gum_emit_prolog (cw, next_hop_stack_displacement);
+  gum_interceptor_backend_emit_prolog (self, cw, next_hop_stack_displacement);
 
   gum_x86_writer_put_lea_reg_reg_offset (cw, GUM_X86_XSI,
       GUM_X86_XBP, GUM_FRAME_OFFSET_CPU_CONTEXT);
@@ -404,15 +413,16 @@ gum_emit_leave_thunk (GumX86Writer * cw)
       GUM_ARG_REGISTER, GUM_X86_XSI,
       GUM_ARG_REGISTER, GUM_X86_XDX);
 
-  gum_emit_epilog (cw, GUM_POINT_LEAVE);
+  gum_interceptor_backend_emit_epilog (self, cw, GUM_POINT_LEAVE);
 }
 
 static void
-gum_emit_prolog (GumX86Writer * cw,
-                 gssize stack_displacement)
+gum_interceptor_backend_emit_prolog (GumInterceptorBackend * self,
+                                     GumX86Writer * cw,
+                                     gssize stack_displacement)
 {
-  guint8 fxsave[] = {
-    0x0f, 0xae, 0x04, 0x24 /* fxsave [esp] */
+  guint8 xchg_r9_rsp[] = {
+    0x49, 0x87, 0xe1 /* xchg r9,rsp  */
   };
 
   /*
@@ -424,6 +434,16 @@ gum_emit_prolog (GumX86Writer * cw,
    * [alignment_padding]
    * [extended_context]
    */
+  // gum_x86_writer_put_pop_reg (cw, GUM_X86_R8);
+  // gum_x86_writer_put_push_reg (cw, GUM_X86_R8);
+  // gum_x86_writer_put_mov_reg_address (cw, GUM_X86_R9,
+  //     GUM_ADDRESS (&self->stack_orig));
+  // gum_x86_writer_put_mov_reg_ptr_reg (cw, GUM_X86_R9, GUM_X86_XSP);
+  // gum_x86_writer_put_mov_reg_address (cw, GUM_X86_R9,
+  //     GUM_ADDRESS (&self->stack_alt + (2 * 1024 * 1024)));
+  // gum_x86_writer_put_bytes (cw, xchg_r9_rsp, sizeof (xchg_r9_rsp));
+  // gum_x86_writer_put_push_reg (cw, GUM_X86_R8);
+
   gum_x86_writer_put_pushfx (cw);
   gum_x86_writer_put_cld (cw); /* C ABI mandates this */
   gum_x86_writer_put_pushax (cw); /* all of GumCpuContext except for xip */
@@ -442,18 +462,15 @@ gum_emit_prolog (GumX86Writer * cw,
   gum_x86_writer_put_mov_reg_reg (cw, GUM_X86_XBP, GUM_X86_XSP);
   gum_x86_writer_put_and_reg_u32 (cw, GUM_X86_XSP, (guint32) ~(16 - 1));
   gum_x86_writer_put_sub_reg_imm (cw, GUM_X86_XSP, 512);
-  gum_x86_writer_put_bytes (cw, fxsave, sizeof (fxsave));
+  gum_x86_writer_put_fxsave_reg_ptr (cw, GUM_X86_XSP);
 }
 
 static void
-gum_emit_epilog (GumX86Writer * cw,
-                 GumPointCut point_cut)
+gum_interceptor_backend_emit_epilog (GumInterceptorBackend * self,
+                                     GumX86Writer * cw,
+                                     GumPointCut point_cut)
 {
-  guint8 fxrstor[] = {
-    0x0f, 0xae, 0x0c, 0x24 /* fxrstor [esp] */
-  };
-
-  gum_x86_writer_put_bytes (cw, fxrstor, sizeof (fxrstor));
+  gum_x86_writer_put_fxrstor_reg_ptr (cw, GUM_X86_XSP);
   gum_x86_writer_put_mov_reg_reg (cw, GUM_X86_XSP, GUM_X86_XBP);
 
   gum_x86_writer_put_lea_reg_reg_offset (cw, GUM_X86_XSP,
@@ -461,6 +478,10 @@ gum_emit_epilog (GumX86Writer * cw,
                                           GumCpuContext.xip */
   gum_x86_writer_put_popax (cw);
   gum_x86_writer_put_popfx (cw);
+
+  // gum_x86_writer_put_mov_reg_address (cw, GUM_X86_R9,
+  //     GUM_ADDRESS (&self->stack_orig));
+  // gum_x86_writer_put_xchg_reg_reg_ptr (cw, GUM_X86_XSP, GUM_X86_R9);
 
   if (point_cut == GUM_POINT_LEAVE)
   {
